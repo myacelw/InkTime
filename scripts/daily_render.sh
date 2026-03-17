@@ -6,7 +6,7 @@ set -euo pipefail
 # =========================================================
 
 # 修改为你的项目目录
-PROJECT_DIR="/path/to/inktime"
+PROJECT_DIR="/Users/liuwei/Developer/InkTime"
 
 VENV_DIR="$PROJECT_DIR/venv"
 PYTHON_BIN="$VENV_DIR/bin/python"

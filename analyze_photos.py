@@ -19,7 +19,9 @@ import shutil
 # NAS 掉盘守护（macOS /Volumes）
 # =======================
 NAS_MOUNT_URL = str(getattr(cfg, "NAS_MOUNT_URL", "") or "").strip()
-NAS_MOUNT_POINT = Path(str(getattr(cfg, "NAS_MOUNT_POINT", "/Volumes/photo") or "/Volumes/photo")).expanduser()
+NAS_MOUNT_POINT = Path(
+    str(getattr(cfg, "NAS_MOUNT_POINT", "/Volumes/photo") or "/Volumes/photo")
+).expanduser()
 NAS_RETRY_TIMES = int(getattr(cfg, "NAS_RETRY_TIMES", 3) or 3)
 NAS_RETRY_SLEEP_SEC = float(getattr(cfg, "NAS_RETRY_SLEEP_SEC", 2.0) or 2.0)
 
@@ -103,7 +105,9 @@ def _read_bytes_with_nas_retry(path: Path) -> bytes:
 
             # 如果挂载看起来还 OK，但仍然读失败，按重试策略稍等再试
             if attempt < NAS_RETRY_TIMES:
-                print(f"[WARN] 读文件失败（第 {attempt}/{NAS_RETRY_TIMES} 次），稍后重试：{e}")
+                print(
+                    f"[WARN] 读文件失败（第 {attempt}/{NAS_RETRY_TIMES} 次），稍后重试：{e}"
+                )
                 time.sleep(max(0.1, NAS_RETRY_SLEEP_SEC))
                 continue
 
@@ -144,6 +148,12 @@ MODEL_NAME = str(
 # API KEY（仍允许用环境变量覆盖）
 API_KEY = str(getattr(cfg, "API_KEY", None) or os.environ.get("LMSTUDIO_API_KEY", ""))
 
+# LLM API 类型
+LLM_API_TYPE = str(getattr(cfg, "LLM_API_TYPE", "openai") or "openai")
+
+# 是否禁用思考功能
+THINK_DISABLED = bool(getattr(cfg, "THINK_DISABLED", False) or False)
+
 # 每次处理多少张；None 为不限制
 BATCH_LIMIT = getattr(cfg, "BATCH_LIMIT", None)
 
@@ -156,7 +166,12 @@ TIMEOUT = float(getattr(cfg, "TIMEOUT", 600) or 600)
 VLM_MAX_LONG_EDGE = int(getattr(cfg, "VLM_MAX_LONG_EDGE", 2560) or 2560)
 
 # 中文城市数据库位置
-WORLD_CITIES_CSV = Path(str(getattr(cfg, "WORLD_CITIES_CSV", "data/world_cities_zh.csv") or "data/world_cities_zh.csv")).expanduser()
+WORLD_CITIES_CSV = Path(
+    str(
+        getattr(cfg, "WORLD_CITIES_CSV", "data/world_cities_zh.csv")
+        or "data/world_cities_zh.csv"
+    )
+).expanduser()
 if not WORLD_CITIES_CSV.is_absolute():
     WORLD_CITIES_CSV = (ROOT_DIR / WORLD_CITIES_CSV).resolve()
 
@@ -170,6 +185,7 @@ HOME_RADIUS_KM = float(getattr(cfg, "HOME_RADIUS_KM", 60.0) or 60.0)
 # exiftool 是否可用：缺失时只降级 GPS/部分 EXIF，不中断流程
 EXIFTOOL_AVAILABLE = False
 
+
 def require_exiftool() -> None:
     global EXIFTOOL_AVAILABLE
     EXIFTOOL_AVAILABLE = shutil.which("exiftool") is not None
@@ -181,6 +197,119 @@ def require_exiftool() -> None:
             "       Ubuntu/Debian: sudo apt-get install -y libimage-exiftool-perl\n"
             "       Windows: choco install exiftool"
         )
+
+
+def _score_to_rating(memory_score: float, beauty_score: float) -> int:
+    """将记忆分和美观分转换为 0-5 星的 Rating。
+
+    采用加权平均 + 动态分段映射，使星级分布呈金字塔型：
+    - 记忆分权重 70%，美观分权重 30%（回忆价值更重要）
+    - 阈值基于实际分数分布的第 N 百分位设定
+
+    目标分布（金字塔型）：
+    - 5 星：约 2-5%  （前 5% 的顶级照片）
+    - 4 星：约 15-20%（前 20% 的优秀照片）
+    - 3 星：约 45-50%（中等，主流）
+    - 2 星：约 20-25%（一般）
+    - 1 星：约 10-15%（较差）
+    - 0 星：约 3-5%  （无价值）
+    """
+    # 加权平均：memory 占 70%，beauty 占 30%
+    weighted_score = memory_score * 0.7 + beauty_score * 0.3
+
+    # 阈值基于实际数据分布设定（634 张照片分析）：
+    # 95 百分位=88.2，90 百分位=86.8，85 百分位=85.6，80 百分位=84.4
+    if weighted_score >= 88:  # 前 5%
+        return 5
+    elif weighted_score >= 85:  # 前 20%
+        return 4
+    elif weighted_score >= 78:  # 中等（主流）
+        return 3
+    elif weighted_score >= 65:  # 一般
+        return 2
+    elif weighted_score >= 50:  # 较差
+        return 1
+    else:
+        return 0
+
+
+def write_metadata_to_image(
+    path: Path,
+    caption: str,
+    side_caption: str | None,
+    ptype: str,
+    memory_score: float,
+    beauty_score: float,
+    reason: str,
+) -> bool:
+    """使用 exiftool 将 AI 生成的文案和评分写入图片元数据。
+
+    写入字段:
+    - XMP:Description: 一句话文案 (side_caption)
+    - EXIF:Rating + XMP:Rating: 综合评分转换为 0-5 星（双标准兼容）
+    - UserComment: 完整的 AI 分析信息 (可读文本格式)
+
+    Returns:
+        bool: 是否写入成功
+    """
+    if not EXIFTOOL_AVAILABLE:
+        return False
+
+    try:
+        cmd = [
+            "exiftool",
+            "-overwrite_original",
+            "-charset",
+            "UTF8",
+        ]
+
+        # 一句话文案 (写入 XMP:Description)
+        if side_caption:
+            cmd.append(f"-XMP:Description={side_caption}")
+
+        # 照片类型 (使用 Subject 字段，避免 Keywords 编码问题)
+        if ptype:
+            cmd.append(f"-Subject={ptype}")
+
+        # 综合评分转换为 0-5 星（同时写入 EXIF 和 XMP 以确保最大兼容性）
+        rating = _score_to_rating(memory_score, beauty_score)
+        cmd.append(f"-EXIF:Rating={rating}")
+        cmd.append(f"-XMP:Rating={rating}")
+
+        # 完整信息 - 使用可读的文本格式 (类似 YAML)
+        lines = [
+            f"画面描述：{caption}",
+            f"值得回忆度：{memory_score:.1f}",
+            f"美观程度：{beauty_score:.1f}",
+            f"评分理由：{reason}",
+        ]
+
+        full_text = "\n".join(lines)
+        cmd.append(f"-UserComment={full_text}")
+
+        cmd.append(str(path))
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode == 0:
+            print(f"  [EXIF] 已写入图片元数据。")
+            return True
+        else:
+            print(f"  [WARN] exiftool 写入失败：{result.stderr.strip()}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        print(f"  [WARN] exiftool 写入超时。")
+        return False
+    except Exception as e:
+        print(f"  [WARN] 写入元数据失败：{e}")
+        return False
+
 
 def encode_image_to_b64(path: Path) -> str:
     """读取图片并（可选）缩放长边后，重新编码为 JPEG，再转 base64。
@@ -223,7 +352,7 @@ def encode_image_to_b64(path: Path) -> str:
 
         out = io.BytesIO()
         # quality 92 在观感和体积之间比较平衡；optimize 可能更慢但通常能降体积
-        img.save(out, format="JPEG", quality=92, optimize=True)
+        img.save(out, format="JPEG", quality=85, optimize=True)
         clean_bytes = out.getvalue()
         return base64.b64encode(clean_bytes).decode("utf-8")
 
@@ -334,12 +463,12 @@ def ensure_table(conn: sqlite3.Connection) -> None:
         pass
     conn.commit()
 
+
 # 生成一句话文案
 def generate_side_caption(image_path: Path) -> str | None:
     system_prompt = (
         "你是一位为「电子相框」撰写旁白短句的中文文案助手。\n"
         "你的目标不是描述画面，而是为画面补上一点“画外之意”。\n\n"
-
         "创作原则：\n"
         "1. 避免使用以下词语：世界、梦、时光、岁月、温柔、治愈、刚刚好、悄悄、慢慢 等（但不是绝对禁止）。\n"
         "2. 严禁使用如下句式：……里……着整个世界；……里……着整个夏天；……得像……（简单的比喻）; ……比……还……； ……得比……更……。\n"
@@ -352,7 +481,6 @@ def generate_side_caption(image_path: Path) -> str | None:
         "   - 对时间、记忆、瞬间的含蓄感受\n"
         "   - 看似平淡但有余味的一句判断\n"
         "7. 避免小学生作文式的、套路式的模板化表达\n"
-
         "格式要求：\n"
         "1. 只输出一句中文短句，不要换行，不要引号，不要任何解释。\n"
         "2. 建议长度 8～24 个汉字，最多不超过 30 个汉字。\n"
@@ -385,12 +513,30 @@ def generate_side_caption(image_path: Path) -> str | None:
         ],
         "temperature": 0.7,
         "max_tokens": 64,
-        "top_p": 0.9,
         "stream": False,
     }
 
+    if LLM_API_TYPE == "ollama":
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt, "images": [img_b64]},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 64,
+            "stream": False,
+        }
+
+    if THINK_DISABLED:
+        payload["think"] = False
+
     try:
-        resp = requests.post(API_URL, headers=headers, json=payload, timeout=min(120, TIMEOUT))
+        resp = requests.post(
+            API_URL, headers=headers, json=payload, timeout=min(120, TIMEOUT)
+        )
+        print("[DEBUG] generate_side_caption 耗时:", resp.elapsed.total_seconds())
+
     except Exception:
         return None
 
@@ -399,14 +545,27 @@ def generate_side_caption(image_path: Path) -> str | None:
 
     try:
         data = resp.json()
-        content = data["choices"][0]["message"]["content"]
+        data0 = data["choices"][0] if "choices" in data else data
+        content = data0["message"]["content"]
     except Exception:
         return None
 
     if not isinstance(content, str):
         content = str(content)
 
-    caption = content.strip().strip("“”\"'")
+    # 清理可能存在的 Markdown 代码块标记
+    caption = content.strip()
+
+    # 移除 Markdown 代码块
+    import re
+
+    markdown_pattern = r"```(?:\w+)?\s*\n?(.*?)\n?```"
+    match = re.search(markdown_pattern, caption, re.DOTALL | re.IGNORECASE)
+    if match:
+        caption = match.group(1).strip()
+
+    # 移除引号
+    caption = caption.strip(""""'""")
     return caption or None
 
 
@@ -427,6 +586,7 @@ def list_images(limit: int | None = None) -> list[Path]:
     if limit is not None:
         files = files[:limit]
     return files
+
 
 # 排除 Screenshot 图片
 def is_screenshot(path: Path) -> bool:
@@ -451,7 +611,11 @@ def filter_unscored(conn: sqlite3.Connection, paths: list[Path]) -> list[Path]:
 def _convert_gps_to_deg(value):
     try:
         d, m, s = value
-        return float(d[0]) / float(d[1]) + float(m[0]) / float(m[1]) / 60.0 + float(s[0]) / float(s[1]) / 3600.0
+        return (
+            float(d[0]) / float(d[1])
+            + float(m[0]) / float(m[1]) / 60.0
+            + float(s[0]) / float(s[1]) / 3600.0
+        )
     except Exception:
         return None
 
@@ -588,22 +752,30 @@ CityRecord = Tuple[float, float, str, str]  # (lat, lon, name_zh, name_en)
 _CITY_CACHE_CITIES: List[CityRecord] | None = None
 _CITY_CACHE_GRID: Dict[Tuple[int, int], List[int]] | None = None
 
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    )
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return r * c
+
 
 def grid_key(lat: float, lon: float) -> Tuple[int, int]:
     gx = int(math.floor(lat / CITY_GRID_DEG))
     gy = int(math.floor(lon / CITY_GRID_DEG))
     return gx, gy
 
-def load_world_cities(csv_path: Path) -> Tuple[List[CityRecord], Dict[Tuple[int, int], List[int]]]:
+
+def load_world_cities(
+    csv_path: Path,
+) -> Tuple[List[CityRecord], Dict[Tuple[int, int], List[int]]]:
     if not csv_path.exists():
         raise SystemExit(f"[FATAL] 找不到城市索引文件: {csv_path}")
 
@@ -628,6 +800,7 @@ def load_world_cities(csv_path: Path) -> Tuple[List[CityRecord], Dict[Tuple[int,
 
     print(f"[INFO] 已加载中文城市库: {csv_path}")
     return cities, grid_index
+
 
 def find_nearest_city(
     lat: float,
@@ -672,6 +845,7 @@ def find_nearest_city(
     _, _, name_zh, name_en = cities[best_idx]
     return name_zh or name_en or ""
 
+
 def get_city_resolver():
     global _CITY_CACHE_CITIES, _CITY_CACHE_GRID
     if _CITY_CACHE_CITIES is None or _CITY_CACHE_GRID is None:
@@ -680,7 +854,9 @@ def get_city_resolver():
     def resolve(lat: float | None, lon: float | None) -> str:
         if lat is None or lon is None:
             return ""
-        return find_nearest_city(lat, lon, _CITY_CACHE_CITIES, _CITY_CACHE_GRID, max_km=CITY_MAX_DISTANCE_KM)
+        return find_nearest_city(
+            lat, lon, _CITY_CACHE_CITIES, _CITY_CACHE_GRID, max_km=CITY_MAX_DISTANCE_KM
+        )
 
     return resolve
 
@@ -702,7 +878,6 @@ def call_vlm(image_path: Path) -> dict:
         "3）给出 0~100 的“值得回忆度” memory_score（精确到一位小数），\n"
         "4）给出 0~100 的“美观程度” beauty_score（精确到一位小数），\n"
         "5）用简短中文 reason 解释原因（不超过 40 字）。\n\n"
-
         "【值得回忆度（memory_score）评分方法】\n"
         "请先按照值得回忆的程度，先确定照片的'得分区间'，再进行精调：\n"
         "如何判定值得回忆度（memory_score）的得分区间：\n"
@@ -719,33 +894,27 @@ def call_vlm(image_path: Path) -> dict:
         "- 优美风景：画面中含有壮丽的自然风光，或精美、有秩序感的构图 → 少许提高评分；\n"
         "- 旅行意义：异地、地标、旅途情景 → 少许提高评分。\n\n"
         "- 画质：画面不清晰、模糊、有残影、虚焦 → 微微降低评分。\n\n"
-
         "【重点照片的处理】\n"
         "如果画面中含有：孩子/猫咪/宠物题材，这些主题更容易产生高回忆价值，请直接以75分为中心，并大幅提高评分”。\n"
-
         "【明显低价值图片的处理】\n"
         "对以下低价值图片，必须将 memory_score 压低到 0~25（最多不超过 39）。\n"
         "- 裸露、低俗、色情或违反公序良俗的图片。\n\n"
         "- 账单、收据、广告、随手拍的杂物、测试图片、屏幕截图等。\n\n"
-        
         "【美观分（beauty_score）评分方法】\n"
         "美观分只评价视觉：构图、光线、清晰度、色彩、主体突出。\n"
         "不要被“孩子/猫/旅行”主题绑架美观分：主题不等于好看。\n"
-
         "请严格只输出 JSON，格式如下：\n"
         "{\n"
-        "  \"caption\": \"……\",\n"
-        "  \"type\": \"人物/家庭/旅行/…… 可以带多个type\",\n"
-        "  \"memory_score\": 0.0-100.0 的数字, 精确到 1 位小数\n"
-        "  \"beauty_score\": 0.0-100.0 的数字, 精确到 1 位小数\n"
-        "  \"reason\": \"不超过 60 字的中文理由\"\n"
+        '  "caption": "……",\n'
+        '  "type": "人物/家庭/旅行/…… 可以带多个type",\n'
+        '  "memory_score": 0.0-100.0 的数字, 精确到 1 位小数\n'
+        '  "beauty_score": 0.0-100.0 的数字, 精确到 1 位小数\n'
+        '  "reason": "不超过 60 字的中文理由"\n'
         "}\n"
         "不要输出任何多余文字，不要加注释。"
     )
 
-    user_text = (
-        "下面是照片的内容，请结合图像本身完成上述任务。\n"
-    )
+    user_text = "下面是照片的内容，请结合图像本身完成上述任务。\n"
 
     headers = {"Content-Type": "application/json"}
     if API_KEY:
@@ -761,9 +930,7 @@ def call_vlm(image_path: Path) -> dict:
                     {"type": "text", "text": user_text},
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}"
-                        },
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                     },
                 ],
             },
@@ -772,7 +939,23 @@ def call_vlm(image_path: Path) -> dict:
         "stream": False,
     }
 
+    if LLM_API_TYPE == "ollama":
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text, "images": [img_b64]},
+            ],
+            "temperature": 0.2,
+            "stream": False,
+        }
+
+    if THINK_DISABLED:
+        payload["think"] = False
+
     resp = requests.post(API_URL, headers=headers, json=payload, timeout=TIMEOUT)
+    print("[DEBUG] call_vlm 耗时:", resp.elapsed.total_seconds())
+
     if not resp.ok:
         print("HTTP:", resp.status_code)
         print(resp.text)
@@ -780,19 +963,212 @@ def call_vlm(image_path: Path) -> dict:
 
     data = resp.json()
     try:
-        content = data["choices"][0]["message"]["content"].strip()
+        data0 = data["choices"][0] if "choices" in data else data
+        content = data0["message"]["content"].strip()
     except Exception:
         print("[DEBUG] 返回内容：", data)
         raise RuntimeError("解析失败：无法从 choices[0].message.content 读取内容")
 
-    # content 应该是 JSON 字符串
+    # content 应该是 JSON 字符串，但可能被 Markdown 代码块包裹
     try:
-        obj = json.loads(content)
+        obj = parse_json_response(content)
     except Exception:
         print("[DEBUG] 非 JSON 输出：", content)
         raise RuntimeError("解析失败：模型未按 JSON 输出")
 
     return obj, exif_info
+
+
+def parse_json_response(content: str) -> dict:
+    """解析大语言模型返回的 JSON 响应，兼容多种格式。
+
+    支持的格式：
+    1. 纯 JSON：{"key": "value"}
+    2. Markdown 代码块包裹：```json {...} ```
+    3. 带前缀文本：好的，这是结果：\n```json {...}```
+
+    Args:
+        content: 模型返回的原始内容字符串
+
+    Returns:
+        解析后的字典对象
+
+    Raises:
+        json.JSONDecodeError: JSON 解析失败时抛出
+    """
+    content = content.strip()
+
+    # 1. 尝试直接解析（最快路径）
+    if content.startswith("{") and content.endswith("}"):
+        return json.loads(content)
+
+    # 2. 移除 Markdown 代码块标记
+    # 匹配 ```json ... ``` 或 ``` ... ```
+    import re
+
+    markdown_pattern = r"```(?:json)?\s*\n?(.*?)\n?```"
+    match = re.search(markdown_pattern, content, re.DOTALL | re.IGNORECASE)
+
+    if match:
+        # 提取代码块内的内容
+        content = match.group(1).strip()
+    else:
+        # 3. 尝试从文本中提取 JSON 对象（处理有前缀/后缀文本的情况）
+        # 查找第一个 { 和最后一个 }
+        start_idx = content.find("{")
+        end_idx = content.rfind("}")
+
+        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+            content = content[start_idx : end_idx + 1]
+
+    return json.loads(content)
+
+
+def call_vlm_combined(image_path: Path) -> tuple[dict, str | None, dict]:
+    """一次 LLM 调用同时获取评估结果和一句话文案。
+
+    返回:
+        (result_dict, side_caption, exif_info)
+        - result_dict: 包含 caption, type, memory_score, beauty_score, reason
+        - side_caption: 一句话文案 (可能为 None)
+        - exif_info: EXIF 信息字典
+    """
+    try:
+        img_b64 = encode_image_to_b64(image_path)
+    except Exception as e:
+        raise RuntimeError(f"读取图片失败：{e}")
+
+    exif_info = read_exif(image_path)
+
+    system_prompt = (
+        '你是一个"个人相册照片评估助手",擅长理解真实照片的内容，并从回忆价值和美观角度打分。\n'
+        "同时，你也是一位为「电子相框」撰写旁白短句的中文文案助手。\n\n"
+        "你会收到一张照片 (以 base64 形式提供),你的任务是:\n"
+        "1) 用中文详细描述照片内容 (80~200 字),\n"
+        "2) 判断照片的大致类型：人物/孩子/猫咪/家庭/旅行/风景/美食/宠物/日常/文档/杂物/其他，一张照片可以有不止一个类型。\n"
+        '3) 给出 0~100 的"值得回忆度" memory_score(精确到一位小数),\n'
+        '4) 给出 0~100 的"美观程度" beauty_score(精确到一位小数),\n'
+        "5) 用简短中文 reason 解释原因 (不超过 40 字)。\n"
+        '6) 为照片写一句"画外之意"的旁白短句 side_caption(8~24 字)。\n\n'
+        "【值得回忆度 (memory_score) 评分方法】\n"
+        "请先按照值得回忆的程度，先确定照片的'得分区间',再进行精调:\n"
+        "如何判定值得回忆度 (memory_score) 的得分区间:\n"
+        "- 垃圾/随手拍/无意义记录：40.0 分以下 (常见为 0~25;若还能勉强辨认但无故事，也不要超过 39.9)。\n"
+        "- 稍微有点可回忆价值：以 65.0 分为中心 (大多落在 58.1~70.3)。\n"
+        "- 不错的回忆价值：以 75 分为中心 (大多落在 68.7~82.4)。\n"
+        "- 特别精彩、强烈值得珍藏：以 85 分为中心 (大多落在 79.1~95.9;\n"
+        "如何继续精调 memory_score 得分 (若同时符合几条加分项，加分可叠加):\n"
+        "- 人物与关系：画面中含有面积较大的人脸，有人物互动，或属于合影 → 大幅提高评分;\n"
+        "- 事件性：生日/聚会/仪式/舞台/明显事件 → 少许提高评分;\n"
+        '- 稀缺性与不可复现：明显"这一刻很难再来一次" → 大幅提高评分;\n'
+        "- 情绪强度：笑、哭、惊喜、拥抱、互动、氛围强 → 少许提高评分;\n"
+        "- 信息密度：画面能讲清楚发生了什么 → 微微提高评分;\n"
+        "- 优美风景：画面中含有壮丽的自然风光，或精美、有秩序感的构图 → 少许提高评分;\n"
+        "- 旅行意义：异地、地标、旅途情景 → 少许提高评分。\n\n"
+        "- 画质：画面不清晰、模糊、有残影、虚焦 → 微微降低评分。\n\n"
+        "【重点照片的处理】\n"
+        '如果画面中含有：孩子/猫咪/宠物题材，这些主题更容易产生高回忆价值，请直接以 75 分为中心，并大幅提高评分"。\n'
+        "【明显低价值图片的处理】\n"
+        "对以下低价值图片，必须将 memory_score 压低到 0~25(最多不超过 39)。\n"
+        "- 裸露、低俗、色情或违反公序良俗的图片。\n\n"
+        "- 账单、收据、广告、随手拍的杂物、测试图片、屏幕截图等。\n\n"
+        "【美观分 (beauty_score) 评分方法】\n"
+        "美观分只评价视觉：构图、光线、清晰度、色彩、主体突出。\n"
+        '不要被"孩子/猫/旅行"主题绑架美观分：主题不等于好看。\n\n'
+        "【一句话文案 (side_caption) 创作原则】\n"
+        "1. 避免使用以下词语：世界、梦、时光、岁月、温柔、治愈、刚刚好、悄悄、慢慢 等 (但不是绝对禁止)。\n"
+        "2. 严禁使用如下句式：……里……着整个世界;……里……着整个夏天;……得像…… (简单的比喻); ……比……还……; ……得比……更……。\n"
+        "3. 只基于图片中能确定的信息进行联想，不要虚构时间、人物关系、事件背景。\n"
+        "4. 文案应自然、有趣，带一点幽默或者诗意，但请避免煽情、鸡汤。\n"
+        '5. 不要复述画面内容本身，而是写"看完画面后，心里多出来的一句话"。\n'
+        "6. 可以偏向以下风格之一:\n"
+        "   - 日常中的微妙情绪\n"
+        "   - 轻微自嘲或冷幽默\n"
+        "   - 对时间、记忆、瞬间的含蓄感受\n"
+        "   - 看似平淡但有余味的一句判断\n"
+        "7. 避免小学生作文式的、套路式的模板化表达\n\n"
+        "请严格只输出 JSON，格式如下:\n"
+        "{\n"
+        '  "caption": "照片内容描述 (80~200 字)",\n'
+        '  "type": "人物/家庭/旅行/…… 可以带多个 type",\n'
+        '  "memory_score": 0.0-100.0 的数字，精确到 1 位小数\n'
+        '  "beauty_score": 0.0-100.0 的数字，精确到 1 位小数\n'
+        '  "reason": "不超过 60 字的中文理由",\n'
+        '  "side_caption": "8~24 字的旁白短句，不要引号"\n'
+        "}\n"
+        "不要输出任何多余文字，不要加注释。"
+    )
+
+    user_text = "下面是照片的内容，请结合图像本身完成上述任务。\n"
+
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                    },
+                ],
+            },
+        ],
+        "temperature": 0.45,
+        "max_tokens": 512,
+        "stream": False,
+    }
+
+    if LLM_API_TYPE == "ollama":
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text, "images": [img_b64]},
+            ],
+            "temperature": 0.45,
+            "max_tokens": 512,
+            "stream": False,
+        }
+
+    if THINK_DISABLED:
+        payload["think"] = False
+
+    resp = requests.post(API_URL, headers=headers, json=payload, timeout=TIMEOUT)
+    print("[DEBUG] call_vlm_combined 耗时:", resp.elapsed.total_seconds())
+
+    if not resp.ok:
+        print("HTTP:", resp.status_code)
+        print(resp.text)
+        raise RuntimeError(f"LM Studio 请求失败：HTTP {resp.status_code}")
+
+    data = resp.json()
+    try:
+        data0 = data["choices"][0] if "choices" in data else data
+        content = data0["message"]["content"].strip()
+    except Exception:
+        print("[DEBUG] 返回内容：", data)
+        raise RuntimeError("解析失败：无法从 choices[0].message.content 读取内容")
+
+    try:
+        obj = parse_json_response(content)
+    except Exception:
+        print("[DEBUG] 非 JSON 输出：", content)
+        raise RuntimeError("解析失败：模型未按 JSON 输出")
+
+    side_caption = obj.get("side_caption")
+    if side_caption:
+        side_caption = str(side_caption).strip().strip("\"'")
+        if not side_caption:
+            side_caption = None
+
+    return obj, side_caption, exif_info
 
 
 def main():
@@ -807,7 +1183,9 @@ def main():
 
     imgs = [p for p in imgs if not is_screenshot(p)]
     if not imgs:
-        raise SystemExit("[INFO] 所有图片都被 Screenshot 过滤规则排除了，没有可处理的图片。")
+        raise SystemExit(
+            "[INFO] 所有图片都被 Screenshot 过滤规则排除了，没有可处理的图片。"
+        )
 
     conn = sqlite3.connect(DB_PATH)
     ensure_table(conn)
@@ -865,7 +1243,9 @@ def main():
         ).fetchone()[0]
 
         if deleted > 0:
-            print(f"[CLEAN] 已同步删除 {deleted} 条数据库残留记录（当前目录：{before_cnt} → {after_cnt}）。")
+            print(
+                f"[CLEAN] 已同步删除 {deleted} 条数据库残留记录（当前目录：{before_cnt} → {after_cnt}）。"
+            )
         else:
             print("[CLEAN] 数据库与磁盘文件一致，无需清理。")
 
@@ -894,26 +1274,58 @@ def main():
     # total = 已分析(当前目录) + 本次待处理（filter_unscored 产生的目标集合）
     already_done = counted
     total = already_done + len(target_paths)
-    print(f"[INFO] 本次准备处理 {len(target_paths)} 张图片（快照总数 {total}，已分析 {already_done}）。")
+    print(
+        f"[INFO] 本次准备处理 {len(target_paths)} 张图片（快照总数 {total}，已分析 {already_done}）。"
+    )
 
     cur = conn.cursor()
     start_time = time.time()
+
+    # ========== 配置：选择使用哪种调用方式 ==========
+    # True: 使用一次调用模式 (call_vlm_combined) - 更快
+    # False: 使用两次调用模式 (call_vlm + generate_side_caption) - 可对比效果
+    USE_COMBINED_VLM = True
+
+    # ========== 配置：是否将文案写入图片 EXIF 元数据 ==========
+    # True: 写入 (需要 exiftool)
+    # False: 不写入
+    WRITE_TO_IMAGE_EXIF = True
+    # ================================================
 
     for idx, path in enumerate(target_paths, start=1):
         t_photo_start = time.perf_counter()
         sep = "=" * 60
         print("\n" + sep)
-        print(f"[{idx}/{len(target_paths)}] 处理: {path}")
+        print(f"[{idx}/{len(target_paths)}] 处理：{path}")
         try:
-            result, exif_info = call_vlm(path)
+            if USE_COMBINED_VLM:
+                result, side_caption, exif_info = call_vlm_combined(path)
+            else:
+                result, exif_info = call_vlm(path)
+                side_caption = generate_side_caption(path)
         except Exception as e:
-            print(f"[WARN] 调用模型失败: {e}")
+            print(f"[WARN] 调用模型失败：{e}")
             continue
         t_after_vlm = time.perf_counter()
         vlm_cost = t_after_vlm - t_photo_start
+        side_cost = 0.0
 
         caption = str(result.get("caption", "")).strip()
-        ptype = str(result.get("type", "")).strip()
+
+        # 处理 type 字段：支持列表或字符串，去重后保存
+        type_raw = result.get("type", "")
+        if isinstance(type_raw, list):
+            # 列表去重，保持原有顺序
+            seen = set()
+            unique_types = []
+            for t in type_raw:
+                t_stripped = str(t).strip()
+                if t_stripped and t_stripped not in seen:
+                    seen.add(t_stripped)
+                    unique_types.append(t_stripped)
+            ptype = "/".join(unique_types)
+        else:
+            ptype = str(type_raw).strip()
         try:
             memory_score = float(result.get("memory_score", 0.0))
         except Exception:
@@ -923,10 +1335,6 @@ def main():
         except Exception:
             beauty_score = 0.0
         reason = str(result.get("reason", "")).strip()
-
-        side_caption = generate_side_caption(path)
-        t_after_side = time.perf_counter()
-        side_cost = t_after_side - t_after_vlm
 
         width = exif_info.get("width")
         height = exif_info.get("height")
@@ -1027,6 +1435,13 @@ def main():
             ),
         )
         conn.commit()
+
+        # 写入图片 EXIF 元数据
+        if WRITE_TO_IMAGE_EXIF:
+            write_metadata_to_image(
+                path, caption, side_caption, ptype, memory_score, beauty_score, reason
+            )
+
         t_photo_end = time.perf_counter()
         total_cost = t_photo_end - t_photo_start
         # pretty timing summary
@@ -1051,7 +1466,9 @@ def main():
         remaining = max(total - processed_now, 0)
         eta = format_eta(remaining * avg_per) if avg_per > 0 else "00:00:00"
 
-        print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {total_cost:4.1f}s  预计剩余 {eta} ")
+        print(
+            f"[进度] {bar} {progress * 100:5.1f}%  {processed_now}/{total}  本张耗时 {total_cost:4.1f}s  预计剩余 {eta} "
+        )
 
     conn.close()
     print("\n[完成] 本批次处理完成。")

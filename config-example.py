@@ -52,3 +52,20 @@ MEMORY_THRESHOLD = 70.0
 
 # 每日挑选的照片数量
 DAILY_PHOTO_QUANTITY = 5
+
+# ==================== Immich 集成配置 ====================
+# 用于将高分照片自动同步到 Immich 标记为收藏
+# 如果不使用 Immich，保持默认值即可
+
+# Immich 服务器地址（包含端口）
+IMMICH_SERVER = "http://localhost:2283"
+
+# Immich API Key（在 Immich 网页端：管理面板 → API Keys → 创建新密钥）
+IMMICH_API_KEY = ""
+
+# 本地照片路径前缀（与数据库中的路径一致）
+LOCAL_PATH_PREFIX = "/Volumes/KIOXIA/photos"
+
+# Immich 中的路径前缀（Immich 导入时使用的路径）
+# 例如：Immich 中显示为 "ext_photos/2018-10 日本/DSC_0781.JPG"
+IMMICH_PATH_PREFIX = "ext_photos"
